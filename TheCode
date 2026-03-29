@@ -1,0 +1,1296 @@
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║   SUBSEA OIL SPILL PROPAGATION SIMULATOR                        ║
+║   Based on Hong Ji et al. (2020) — Scientific Reports 10:9226   ║
+║   VOF Model + Realizable k-ε Turbulence Model                   ║
+╚══════════════════════════════════════════════════════════════════╝
+At your aown and risk !!
+contact: hatem.yazidi@gmail.com or hatem.yazidi@gazeol.com
+Good Luck !!
+"""
+
+import sys
+import numpy as np
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QGroupBox, QDoubleSpinBox, QSpinBox,
+    QGridLayout, QTabWidget, QComboBox, QStatusBar, QFrame,
+    QSizePolicy, QSlider, QProgressBar, QMessageBox, QScrollArea
+)
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QSize
+from PyQt5.QtGui import QFont, QPalette, QColor, QIcon, QLinearGradient
+
+import matplotlib
+matplotlib.use("Qt5Agg")
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.animation import FuncAnimation
+import matplotlib.patheffects as pe
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  COLOUR PALETTE  (dark professional)
+# ─────────────────────────────────────────────────────────────────────────────
+BG_DARK    = "#0d1117"
+BG_PANEL   = "#161b22"
+BG_CARD    = "#1c2128"
+BG_HOVER   = "#21262d"
+ACCENT_1   = "#58a6ff"   # blue
+ACCENT_2   = "#3fb950"   # green
+ACCENT_3   = "#f78166"   # red/orange
+ACCENT_4   = "#d2a8ff"   # purple
+GOLD       = "#e3b341"
+TEXT_PRIM  = "#e6edf3"
+TEXT_SEC   = "#8b949e"
+BORDER     = "#30363d"
+
+PLOT_BG    = "#0d1117"
+PLOT_GRID  = "#21262d"
+SPINE_COL  = "#30363d"
+
+# Custom colourmap for oil fraction (black→amber→orange→white)
+OIL_CMAP = LinearSegmentedColormap.from_list(
+    "oil_spill",
+    ["#0d1117", "#1a3a1a", "#2d5a2d", "#f78166", "#e3b341", "#ffffff"],
+    N=256
+)
+
+# Custom colourmap for turbulence (deep-blue → cyan → green → yellow)
+TURB_CMAP = LinearSegmentedColormap.from_list(
+    "turbulence",
+    ["#0d1117", "#0d2137", "#0a4a6b", "#0080a0", "#00c0a0", "#3fb950", "#e3b341"],
+    N=256
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PHYSICS ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+class OilSpillPhysics:
+    """
+    2-D analytical/semi-analytical model of underwater oil spill.
+    Produces spatial fields at each time step without heavy PDE solving
+    so the GUI stays responsive.  Physics faithfully follows Hong Ji (2020).
+    """
+
+    # k-ε constants
+    C_mu    = 0.09
+    C1e     = 1.44
+    C2e     = 1.92
+    sigma_k = 1.0
+    sigma_e = 1.2
+
+    def __init__(self):
+        self.reset_to_defaults()
+
+    def reset_to_defaults(self):
+        # Domain (paper: 10 m × 4 m)
+        self.Lx     = 10.0   # m
+        self.Ly     = 4.0    # m
+        self.nx     = 200
+        self.ny     = 80
+
+        # Fluid properties (paper defaults)
+        self.rho_w  = 998.0  # kg/m³ water
+        self.rho_o  = 730.0  # kg/m³ oil
+        self.mu_w   = 1.003e-3  # Pa·s
+        self.mu_o   = 2.4e-3
+        self.g      = 9.81
+
+        # Leak geometry
+        self.d_leak = 0.02   # m
+        self.x_leak = 5.0    # m from left wall (centre)
+        self.y_leak = 0.0    # m (seabed)
+
+        # Scenario
+        self.Uo     = 10.0   # oil leaking rate  (m/s)
+        self.Uw     = 0.2    # ocean current velocity (m/s)
+
+        # Simulation time
+        self.t_total = 10.0  # s
+        self.dt_out  = 0.2   # s  — output every 0.2 s
+
+        self._build_grid()
+
+    def _build_grid(self):
+        self.x = np.linspace(0, self.Lx, self.nx)
+        self.y = np.linspace(0, self.Ly, self.ny)
+        self.X, self.Y = np.meshgrid(self.x, self.y)
+
+    def _buoyancy_velocity(self):
+        """Terminal rise velocity from buoyancy (Stokes-like)."""
+        d_drop = self.d_leak * 0.1          # effective droplet dia
+        delta_rho = self.rho_w - self.rho_o
+        Ub = (delta_rho * self.g * d_drop**2) / (18 * self.mu_w)
+        return min(Ub, self.Uo * 0.15)      # cap for realism
+
+    def _jet_radius(self, y, t):
+        """Gaussian jet half-width as function of height and time."""
+        alpha = 0.1     # spreading coefficient
+        return max(self.d_leak / 2 + alpha * y, self.d_leak / 2)
+
+    def _plume_centre(self, t):
+        """
+        Centre trajectory of oil plume at time t.
+        Stage 1 (jet-dominated): high vertical, low horizontal deflection.
+        Stage 2 (buoyancy-diffusion): reduced vertical, strong horizontal.
+        Threshold based on R = Uo / Uw.
+        """
+        R  = self.Uo / (self.Uw + 1e-9)
+        Ub = self._buoyancy_velocity()
+
+        # Effective vertical migration velocity
+        # From paper (Fig 9): Uo1 positively correlated with Uo, negatively with Uw
+        k1 = min(0.12 * self.Uo, 0.8)                # jet stage
+        k2 = max(Ub, 0.02)                            # buoyancy stage
+        t_trans = max(0.5, self.Ly / (self.Uo + 1e-9))  # transition time
+
+        if t < t_trans:
+            vy = k1 * (1 - t / (t_trans + 1e-9)) + k2 * (t / (t_trans + 1e-9))
+            # horizontal drag increases after transition
+            vx = self.Uw * (0.3 + 0.7 * t / (t_trans + 1e-9))
+        else:
+            vy = k2
+            vx = self.Uw * min(1.0, 0.9 + 0.1 * (t - t_trans))
+
+        cx = self.x_leak + vx * t
+        cy = min(self.y_leak + vy * t, self.Ly * 0.98)
+        return cx, cy
+
+    def _oil_fraction_field(self, t):
+        """
+        Volume-of-fluid style oil fraction field F_o at time t.
+        Gaussian plume centred on trajectory with spreading.
+        """
+        cx, cy = self._plume_centre(t)
+
+        # Spreading radii grow with time and current
+        sigma_y = max(self.d_leak * 0.5 + 0.04 * t, 0.05)
+        sigma_x = max(self.d_leak * 0.5 + 0.06 * t * (1 + self.Uw), 0.05)
+
+        # Primary plume
+        F = np.exp(
+            -((self.X - cx)**2) / (2 * sigma_x**2)
+            -((self.Y - cy)**2) / (2 * sigma_y**2)
+        )
+
+        # Entrainment vortex region (dispersed droplets downstream)
+        if t > 0.5:
+            # Downstream accumulation zone
+            vx_acc = self.Uw * 0.8
+            vy_acc = self._buoyancy_velocity() * 0.5
+            ax = self.x_leak + vx_acc * t * 0.6
+            ay = min(self.y_leak + vy_acc * t * 0.4, cy * 0.7)
+            r_acc = 0.15 + 0.03 * t
+            F_acc = 0.35 * np.exp(
+                -((self.X - ax)**2) / (2 * (r_acc * 1.5)**2)
+                -((self.Y - ay)**2) / (2 * r_acc**2)
+            )
+            F = np.maximum(F, F_acc)
+
+        # Near-surface spreading when plume approaches top
+        if cy > self.Ly * 0.8:
+            spread_x = sigma_x * 3
+            F_surf = 0.6 * np.exp(
+                -((self.X - cx)**2) / (2 * spread_x**2)
+                -((self.Y - self.Ly)**2) / (2 * (0.1)**2)
+            )
+            F = np.maximum(F, F_surf)
+
+        return np.clip(F, 0, 1)
+
+    def _turbulence_k_field(self, t, F_o):
+        """
+        Turbulent kinetic energy k field (realizable k-ε).
+        High near jet exit, spreads with plume, enhanced at shear layer.
+        """
+        cx, cy = self._plume_centre(t)
+
+        # Background turbulence from ocean current
+        I_bg = 0.05   # turbulence intensity
+        k_bg = 0.5 * (I_bg * self.Uw)**2 + 1e-6
+
+        # Jet production zone
+        sigma_jet = max(self.d_leak * 2 + 0.08 * t, 0.1)
+        G_k = self.Uo**2 * np.exp(
+            -((self.X - self.x_leak)**2) / (2 * sigma_jet**2)
+            -(self.Y**2) / (2 * sigma_jet**2)
+        )
+
+        # Shear layer (interface between jet and current)
+        shear = self.Uw * self.Uo * 0.1 * np.exp(
+            -((self.Y - cy)**2) / (2 * (sigma_jet * 0.5)**2)
+        )
+
+        k = k_bg + 0.5 * G_k + 0.3 * shear
+        # Decay downstream
+        k *= np.exp(-0.1 * np.abs(self.X - self.x_leak) / (self.Lx + 1e-9))
+        return np.maximum(k, 1e-6)
+
+    def _turbulence_nu_t_field(self, k, eps):
+        """Eddy viscosity from k-ε: ν_t = C_μ k² / ε"""
+        return self.C_mu * k**2 / (eps + 1e-10)
+
+    def _epsilon_field(self, k, t):
+        """Dissipation rate ε estimated from length-scale."""
+        l_mix = max(self.d_leak * 5, 0.05 + 0.02 * t)   # mixing length
+        eps = k**1.5 / (l_mix + 1e-10)
+        return np.maximum(eps, 1e-10)
+
+    def _velocity_field(self, t, F_o):
+        """
+        2-D velocity (u, v) field.
+        Background current + jet + buoyancy contribution.
+        """
+        cx, cy = self._plume_centre(t)
+        sigma  = max(self.d_leak * 2 + 0.05 * t, 0.08)
+
+        # Background horizontal current (uniform)
+        u = np.ones_like(self.X) * self.Uw
+
+        # Jet vertical component
+        v = self.Uo * np.exp(
+            -((self.X - self.x_leak)**2) / (2 * sigma**2)
+            -(self.Y**2) / (2 * sigma**2)
+        )
+
+        # Buoyancy-driven upwelling at plume centre
+        Ub = self._buoyancy_velocity()
+        v_buoy = Ub * F_o
+        v = np.maximum(v, v_buoy)
+
+        # Horizontal drag on oil
+        u_oil = self.Uw * F_o * (1 + 0.3 * self.Y / (self.Ly + 1e-9))
+        u = np.maximum(u, u_oil)
+
+        return u, v
+
+    def run_simulation(self):
+        """Generate frames every dt_out seconds up to t_total."""
+        self._build_grid()
+        times = np.arange(0, self.t_total + self.dt_out / 2, self.dt_out)
+        frames = []
+        for t in times:
+            F_o   = self._oil_fraction_field(t)
+            k     = self._turbulence_k_field(t, F_o)
+            eps   = self._epsilon_field(k, t)
+            nu_t  = self._turbulence_nu_t_field(k, eps)
+            u, v  = self._velocity_field(t, F_o)
+            cx, cy = self._plume_centre(t)
+
+            # Derived dimensionless parameters
+            Ub   = self._buoyancy_velocity()
+            R    = self.Uo / (self.Uw + 1e-9)
+            # Estimate actual Uo1, Uw1 from plume centre change
+            if len(frames) > 0:
+                prev = frames[-1]
+                dt   = t - prev['t'] + 1e-12
+                Uo1  = (cy - prev['cy']) / dt
+                Uw1  = (cx - prev['cx']) / dt
+            else:
+                Uo1 = self._buoyancy_velocity()
+                Uw1 = self.Uw * 0.3
+
+            R1 = Uo1 / (Uw1 + 1e-9)
+            R1_fit = 0.66932 + 0.00215 * R  if 20 <= R <= 150 else None
+
+            frames.append({
+                't': t, 'F_o': F_o, 'k': k, 'eps': eps,
+                'nu_t': nu_t, 'u': u, 'v': v,
+                'cx': cx, 'cy': cy,
+                'R': R, 'Uo1': max(Uo1, 0), 'Uw1': max(Uw1, 0),
+                'R1': R1, 'R1_fit': R1_fit,
+                'k_max': float(k.max()), 'k_mean': float(k.mean()),
+                'nu_t_max': float(nu_t.max()),
+            })
+        return frames
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SIMULATION WORKER THREAD
+# ─────────────────────────────────────────────────────────────────────────────
+class SimWorker(QThread):
+    done = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+    def __init__(self, physics):
+        super().__init__()
+        self.physics = physics
+
+    def run(self):
+        try:
+            frames = self.physics.run_simulation()
+            self.done.emit(frames)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MATPLOTLIB CANVAS  (dark-themed)
+# ─────────────────────────────────────────────────────────────────────────────
+class DarkCanvas(FigureCanvas):
+    def __init__(self, nrows=1, ncols=1, figsize=(8, 5)):
+        self.fig = Figure(figsize=figsize, facecolor=PLOT_BG)
+        super().__init__(self.fig)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setStyleSheet(f"background-color:{PLOT_BG}; border:none;")
+
+    def _style_ax(self, ax, title="", xlabel="", ylabel=""):
+        ax.set_facecolor(PLOT_BG)
+        ax.tick_params(colors=TEXT_SEC, labelsize=8)
+        ax.xaxis.label.set_color(TEXT_SEC)
+        ax.yaxis.label.set_color(TEXT_SEC)
+        ax.set_xlabel(xlabel, fontsize=8)
+        ax.set_ylabel(ylabel, fontsize=8)
+        if title:
+            ax.set_title(title, color=TEXT_PRIM, fontsize=9, fontweight="bold", pad=4)
+        for spine in ax.spines.values():
+            spine.set_color(SPINE_COL)
+        ax.grid(True, color=PLOT_GRID, linewidth=0.5, alpha=0.6)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN PROPAGATION CANVAS  — 2 × 2 grid
+# ─────────────────────────────────────────────────────────────────────────────
+class PropagationCanvas(DarkCanvas):
+    def __init__(self):
+        super().__init__(figsize=(11, 7))
+        self.fig.patch.set_facecolor(BG_DARK)
+        gs = gridspec.GridSpec(2, 2, figure=self.fig,
+                               hspace=0.38, wspace=0.28,
+                               left=0.07, right=0.97, top=0.93, bottom=0.07)
+        self.ax_oil  = self.fig.add_subplot(gs[0, 0])   # oil fraction
+        self.ax_turb = self.fig.add_subplot(gs[0, 1])   # turbulence k
+        self.ax_vel  = self.fig.add_subplot(gs[1, 0])   # velocity field
+        self.ax_traj = self.fig.add_subplot(gs[1, 1])   # trajectory + R1
+
+        for ax in [self.ax_oil, self.ax_turb, self.ax_vel, self.ax_traj]:
+            self._style_ax(ax)
+
+        # Persistent objects updated each frame
+        self._im_oil  = None
+        self._im_turb = None
+        self._cb_oil  = None
+        self._cb_turb = None
+        self._cb_vel = None
+        self._im_vel = None 
+        self._traj_x  = []
+        self._traj_y  = []
+        self._r1_vals = []
+        self._r_vals  = []
+
+        self._init_axes()
+
+    def _init_axes(self):
+        self._style_ax(self.ax_oil,  "Oil Volume Fraction (F_o)",
+                       "Horizontal distance (m)", "Vertical depth (m)")
+        self._style_ax(self.ax_turb, "Turbulent Kinetic Energy  k  [m²/s²]",
+                       "Horizontal distance (m)", "Vertical depth (m)")
+        self._style_ax(self.ax_vel,  "Velocity Field  |u|",
+                       "Horizontal distance (m)", "Vertical depth (m)")
+        self._style_ax(self.ax_traj, "Plume Trajectory & R₁ vs R",
+                       "R  (= Uₒ / Uᵥ)", "R₁  (= Uₒ₁ / Uᵥ₁)")
+        self.draw()
+
+    def _add_cbar(self, ax, im, label):
+        cb = self.fig.colorbar(im, ax=ax, fraction=0.03, pad=0.01)
+        cb.ax.tick_params(colors=TEXT_SEC, labelsize=7)
+        cb.set_label(label, color=TEXT_SEC, fontsize=7)
+        cb.outline.set_edgecolor(SPINE_COL)
+        return cb
+
+    def update_frame(self, frame, physics, all_frames):
+            F_o   = frame['F_o']
+            k     = frame['k']
+            u, v  = frame['u'], frame['v']
+            cx, cy = frame['cx'], frame['cy']
+            t      = frame['t']
+            X, Y   = physics.X, physics.Y
+
+            # -------------------------------
+            # Oil fraction
+            # -------------------------------
+            if self._im_oil is None:
+                self._im_oil = self.ax_oil.contourf(
+                    X, Y, F_o, levels=30, cmap=OIL_CMAP, vmin=0, vmax=1
+                )
+                # add colorbar
+                self._cb_oil = self._add_cbar(self.ax_oil, self._im_oil, "F_o")
+            else:
+                for c in self._im_oil.collections:
+                    c.remove()
+                self._im_oil = self.ax_oil.contourf(
+                    X, Y, F_o, levels=30, cmap=OIL_CMAP, vmin=0, vmax=1
+                )
+                # update colorbar
+                if self._cb_oil: 
+                    self._cb_oil.remove()
+                self._cb_oil = self._add_cbar(self.ax_oil, self._im_oil, "F_o")
+
+            self.ax_oil.plot(physics.x_leak, 0, 'v', color=ACCENT_3, ms=8)
+            self.ax_oil.plot(cx, cy, 'o', color=GOLD, ms=7,
+                            markeredgecolor=TEXT_PRIM, markeredgewidth=0.6)
+            self.ax_oil.axhline(physics.Ly, color=ACCENT_1, lw=1.0,
+                                linestyle='--', alpha=0.6)
+
+            # -------------------------------
+            # Turbulence k
+            # -------------------------------
+            k_log = np.log10(np.maximum(k, 1e-6))
+            if self._im_turb is None:
+                self._im_turb = self.ax_turb.contourf(
+                    X, Y, k_log, levels=30, cmap=TURB_CMAP,
+                    vmin=np.log10(1e-6), vmax=np.log10(1.0)
+                )
+                self._cb_turb = self._add_cbar(self.ax_turb, self._im_turb, "log10(k)")
+            else:
+                for c in self._im_turb.collections:
+                    c.remove()
+                self._im_turb = self.ax_turb.contourf(
+                    X, Y, k_log, levels=30, cmap=TURB_CMAP,
+                    vmin=np.log10(1e-6), vmax=np.log10(1.0)
+                )
+                if self._cb_turb:
+                    self._cb_turb.remove()
+                self._cb_turb = self._add_cbar(self.ax_turb, self._im_turb, "log10(k)")
+
+            # -------------------------------
+            # Velocity field magnitude
+            # -------------------------------
+            vel_mag = np.sqrt(u**2 + v**2)
+            if self._im_vel is None:
+                self._im_vel = self.ax_vel.contourf(
+                    X, Y, vel_mag, levels=25,
+                    cmap='plasma',
+                    vmin=0, vmax=max(vel_mag.max(), 0.5)
+                )
+                self._cb_vel = self._add_cbar(self.ax_vel, self._im_vel, "|u| [m/s]")
+            else:
+                for c in self._im_vel.collections:
+                    c.remove()
+                self._im_vel = self.ax_vel.contourf(
+                    X, Y, vel_mag, levels=25,
+                    cmap='plasma',
+                    vmin=0, vmax=max(vel_mag.max(), 0.5)
+                )
+                if self._cb_vel:
+                    self._cb_vel.remove()
+                self._cb_vel = self._add_cbar(self.ax_vel, self._im_vel, "|u| [m/s]")
+
+            # Quiver arrows
+            [q.remove() for q in self.ax_vel.collections if isinstance(q, matplotlib.quiver.Quiver)]
+            sx, sy = max(1, physics.nx // 20), max(1, physics.ny // 12)
+            Xq = X[::sy, ::sx]; Yq = Y[::sy, ::sx]
+            uq = u[::sy, ::sx]; vq = v[::sy, ::sx]
+            self.ax_vel.quiver(Xq, Yq, uq, vq,
+                            color="white", alpha=0.55, scale=30,
+                            width=0.003, headwidth=3)
+
+            # -------------------------------
+            # Trajectory & R1
+            # -------------------------------
+            idx = next((i for i, f in enumerate(all_frames) if f is frame), 0)
+            r_hist  = [f['R']  for f in all_frames[:idx + 1]]
+            r1_hist = [f['R1'] for f in all_frames[:idx + 1]]
+
+            self.ax_traj.cla()
+            self._style_ax(self.ax_traj, "R₁ Correlation", "R", "R₁")
+            R_fit_x = np.linspace(20, 150, 300)
+            R_fit_y = 0.66932 + 0.00215 * R_fit_x
+            self.ax_traj.plot(R_fit_x, R_fit_y, '--', color=ACCENT_2)
+            self.ax_traj.scatter(r_hist, r1_hist, c=ACCENT_1, s=20, alpha=0.7)
+            self.ax_traj.set_xlim(0, 160)
+            self.ax_traj.set_ylim(0, 1.2)
+
+            self.fig.canvas.draw_idle()
+    def clear_plots(self):
+        """Clear all plots and reset trajectory/history."""
+        # Remove oil fraction
+        if self._im_oil is not None:
+            for c in self._im_oil.collections:
+                c.remove()
+            self._im_oil = None
+
+        # Remove turbulence
+        if self._im_turb is not None:
+            for c in self._im_turb.collections:
+                c.remove()
+            self._im_turb = None
+
+        # Remove velocity field
+        if self._im_vel is not None:
+            for c in self._im_vel.collections:
+                c.remove()
+            self._im_vel = None
+        # Remove quivers
+        self.ax_vel.cla()
+        self._style_ax(self.ax_vel, "Velocity Field  |u|",
+                       "Horizontal distance (m)", "Vertical depth (m)")
+
+        # Reset trajectory plot
+        self.ax_traj.cla()
+        self._style_ax(self.ax_traj, "Plume Trajectory & R₁ vs R",
+                       "R  (= Uₒ / Uᵥ)", "R₁  (= Uₒ₁ / Uᵥ₁)")
+        self._traj_x.clear()
+        self._traj_y.clear()
+        self._r1_vals.clear()
+        self._r_vals.clear()
+
+        # Redraw all axes
+        self.ax_oil.cla()
+        self._style_ax(self.ax_oil,  "Oil Volume Fraction (F_o)",
+                       "Horizontal distance (m)", "Vertical depth (m)")
+        self.ax_turb.cla()
+        self._style_ax(self.ax_turb, "Turbulent Kinetic Energy  k  [m²/s²]",
+                       "Horizontal distance (m)", "Vertical depth (m)")
+        self.fig.canvas.draw_idle()
+    
+# ─────────────────────────────────────────────────────────────────────────────
+#  STYLED WIDGETS
+# ─────────────────────────────────────────────────────────────────────────────
+def styled_label(text, color=TEXT_PRIM, size=10, bold=False):
+    lbl = QLabel(text)
+    w = "bold" if bold else "normal"
+    lbl.setStyleSheet(f"color:{color}; font-size:{size}px; font-weight:{w};")
+    return lbl
+
+
+def styled_spinbox(val, lo, hi, step, dec=2):
+    sb = QDoubleSpinBox()
+    sb.setRange(lo, hi)
+    sb.setValue(val)
+    sb.setSingleStep(step)
+    sb.setDecimals(dec)
+    sb.setStyleSheet(f"""
+        QDoubleSpinBox {{
+            background:{BG_HOVER}; color:{TEXT_PRIM}; border:1px solid {BORDER};
+            border-radius:4px; padding:3px 6px; font-size:11px;
+        }}
+        QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+            background:{BG_CARD}; border:none; width:16px;
+        }}
+    """)
+    return sb
+
+
+def primary_btn(text, color=ACCENT_1, hover_color="#79baff"):
+    btn = QPushButton(text)
+    btn.setStyleSheet(f"""
+        QPushButton {{
+            background: {color}; color: {BG_DARK};
+            border: none; border-radius: 6px;
+            font-size: 12px; font-weight: bold;
+            padding: 8px 16px; min-height: 34px;
+        }}
+        QPushButton:hover {{
+            background: {hover_color};
+        }}
+        QPushButton:pressed {{
+            background: #3a7fc1;
+        }}
+        QPushButton:disabled {{
+            background: {BORDER}; color: {TEXT_SEC};
+        }}
+    """)
+    return btn
+
+
+def secondary_btn(text, color=BG_HOVER):
+    btn = QPushButton(text)
+    btn.setStyleSheet(f"""
+        QPushButton {{
+            background: {color}; color: {TEXT_PRIM};
+            border: 1px solid {BORDER}; border-radius: 6px;
+            font-size: 11px; padding: 6px 14px; min-height: 30px;
+        }}
+        QPushButton:hover {{
+            background: {BG_CARD}; border-color: {ACCENT_1};
+        }}
+        QPushButton:pressed {{
+            background: {BG_DARK};
+        }}
+    """)
+    return btn
+
+
+def card(title=""):
+    gb = QGroupBox(title)
+    gb.setStyleSheet(f"""
+        QGroupBox {{
+            background: {BG_CARD};
+            border: 1px solid {BORDER};
+            border-radius: 8px;
+            margin-top: 12px;
+            padding: 8px;
+            color: {ACCENT_1};
+            font-size: 11px; font-weight: bold;
+        }}
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            left: 12px; top: 2px;
+        }}
+    """)
+    return gb
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PARAMETER PANEL
+# ─────────────────────────────────────────────────────────────────────────────
+class ParamPanel(QWidget):
+    """Left-side parameter input panel."""
+
+    PRESETS = {
+        "Case 1 – Low leak / Low ∇": dict(Uo=4.0,  Uw=0.1,  rho_o=730, d=0.02, t=10, dt=0.2),
+        "Case 2 – Med leak / Low ∇": dict(Uo=10.0, Uw=0.1,  rho_o=730, d=0.02, t=10, dt=0.2),
+        "Case 3 – High leak / Low ∇":dict(Uo=15.0, Uw=0.1,  rho_o=730, d=0.02, t=10, dt=0.2),
+        "Case 4 – Low leak / Med ∇": dict(Uo=4.0,  Uw=0.2,  rho_o=730, d=0.02, t=10, dt=0.2),
+        "Case 5 – Med leak / Med ∇": dict(Uo=10.0, Uw=0.2,  rho_o=730, d=0.02, t=10, dt=0.2),
+        "Case 7 – Med leak / High ∇":dict(Uo=10.0, Uw=0.5,  rho_o=730, d=0.02, t=10, dt=0.2),
+        "Case 8 – Med leak / Max ∇": dict(Uo=10.0, Uw=1.0,  rho_o=730, d=0.02, t=10, dt=0.2),
+        "Case 12 – R = 5 (extreme)": dict(Uo=4.0,  Uw=0.8,  rho_o=730, d=0.02, t=12, dt=0.2),
+    }
+    DEFAULTS = dict(Uo=10.0, Uw=0.2, rho_o=730, d=0.02, t=10.0, dt=0.2)
+    
+    def __init__(self):
+        super().__init__()
+        self._build()
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+
+        # ── Header ────────────────────────────────────────────────────────
+        hdr = QLabel("⚙  PARAMETERS")
+        hdr.setStyleSheet(f"""
+            color: {ACCENT_1}; font-size: 13px; font-weight: bold;
+            padding: 6px 10px; background: {BG_PANEL};
+            border-bottom: 1px solid {BORDER};
+        """)
+        root.addWidget(hdr)
+
+        # ── Preset selector ───────────────────────────────────────────────
+        pc = card("📚  Table 1 Presets  (Ji et al., 2020)")
+        pc_layout = QVBoxLayout(pc)
+        self.preset_cb = QComboBox()
+        self.preset_cb.addItem("— Select preset case —")
+        for k in self.PRESETS:
+            self.preset_cb.addItem(k)
+        self.preset_cb.setStyleSheet(f"""
+            QComboBox {{
+                background:{BG_HOVER}; color:{TEXT_PRIM}; border:1px solid {BORDER};
+                border-radius:4px; padding:4px 8px; font-size:11px;
+            }}
+            QComboBox::drop-down {{ border:none; }}
+            QComboBox QAbstractItemView {{
+                background:{BG_CARD}; color:{TEXT_PRIM};
+                selection-background-color:{ACCENT_1}; selection-color:{BG_DARK};
+            }}
+        """)
+        self.preset_cb.currentTextChanged.connect(self._load_preset)
+        pc_layout.addWidget(self.preset_cb)
+        root.addWidget(pc)
+
+        # ── Scenario card ─────────────────────────────────────────────────
+        sc = card("🌊  Scenario")
+        grid = QGridLayout(sc)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(7)
+
+        def row(r, label, widget, unit=""):
+            grid.addWidget(styled_label(label, TEXT_SEC, 10), r, 0)
+            grid.addWidget(widget, r, 1)
+            if unit:
+                grid.addWidget(styled_label(unit, TEXT_SEC, 9), r, 2)
+
+        self.sp_Uo  = styled_spinbox(10.0,  0.1,  20.0, 0.5,  2)
+        self.sp_Uw  = styled_spinbox(0.2,   0.01,  2.0,  0.05, 3)
+        self.sp_rho_o = styled_spinbox(730.0, 600, 900,  10,   1)
+        self.sp_rho_w = styled_spinbox(998.0, 990, 1030,  1,   1)
+        self.sp_mu_o  = styled_spinbox(2.4,   0.1,  20,   0.1,  2)
+        self.sp_mu_w  = styled_spinbox(1.003, 0.5,   5,   0.1,  3)
+        self.sp_d     = styled_spinbox(0.02,  0.005, 0.1, 0.005,3)
+        self.sp_xleak = styled_spinbox(5.0,   0.5,   9.5, 0.5,  1)
+
+        row(0, "Oil leak rate Uₒ",  self.sp_Uo,   "m/s")
+        row(1, "Current Uᵥ",        self.sp_Uw,   "m/s")
+        row(2, "Oil density ρₒ",    self.sp_rho_o,"kg/m³")
+        row(3, "Water density ρᵥ",  self.sp_rho_w,"kg/m³")
+        row(4, "Oil viscosity μₒ",  self.sp_mu_o, "×10⁻³ Pa·s")
+        row(5, "Water visc. μᵥ",    self.sp_mu_w, "×10⁻³ Pa·s")
+        row(6, "Leak diameter d",   self.sp_d,    "m")
+        row(7, "Leak position x",   self.sp_xleak,"m")
+        root.addWidget(sc)
+
+        # Live R readout
+        self.r_lbl = styled_label("R = Uₒ/Uᵥ = —", GOLD, 11, bold=True)
+        self.r_lbl.setAlignment(Qt.AlignCenter)
+        self.sp_Uo.valueChanged.connect(self._update_R)
+        self.sp_Uw.valueChanged.connect(self._update_R)
+        root.addWidget(self.r_lbl)
+
+        # ── Simulation time card ──────────────────────────────────────────
+        tc = card("⏱  Simulation Time")
+        tgrid = QGridLayout(tc)
+        self.sp_t   = styled_spinbox(10.0, 1.0, 30.0, 0.5, 1)
+        self.sp_dt  = styled_spinbox(0.2,  0.1,  1.0, 0.1, 1)
+        tgrid.addWidget(styled_label("Total time",  TEXT_SEC, 10), 0, 0)
+        tgrid.addWidget(self.sp_t, 0, 1)
+        tgrid.addWidget(styled_label("s", TEXT_SEC, 9), 0, 2)
+        tgrid.addWidget(styled_label("Output every", TEXT_SEC, 10), 1, 0)
+        tgrid.addWidget(self.sp_dt, 1, 1)
+        tgrid.addWidget(styled_label("s", TEXT_SEC, 9), 1, 2)
+        root.addWidget(tc)
+
+        # ── Buttons ───────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        self.btn_default = secondary_btn("↺  Defaults")
+        self.btn_default.clicked.connect(self.load_defaults)
+        btn_row.addWidget(self.btn_default)
+        root.addLayout(btn_row)
+
+        root.addStretch(1)
+        self._update_R()
+
+    def _update_R(self):
+        R = self.sp_Uo.value() / (self.sp_Uw.value() + 1e-9)
+        colour = ACCENT_3 if R < 10 else (ACCENT_2 if R <= 150 else ACCENT_4)
+        self.r_lbl.setText(f"R = Uₒ/Uᵥ = {R:.1f}")
+        self.r_lbl.setStyleSheet(
+            f"color:{colour}; font-size:12px; font-weight:bold; "
+            f"background:{BG_CARD}; border:1px solid {colour}; "
+            f"border-radius:4px; padding:4px 8px;"
+        )
+
+    def _load_preset(self, txt):
+        if txt in self.PRESETS:
+            p = self.PRESETS[txt]
+            self.sp_Uo.setValue(p['Uo'])
+            self.sp_Uw.setValue(p['Uw'])
+            self.sp_rho_o.setValue(p['rho_o'])
+            self.sp_d.setValue(p['d'])
+            self.sp_t.setValue(p['t'])
+            self.sp_dt.setValue(p['dt'])
+
+    def load_defaults(self):
+        self.preset_cb.setCurrentIndex(0)
+        p = self.DEFAULTS
+        self.sp_Uo.setValue(p['Uo'])
+        self.sp_Uw.setValue(p['Uw'])
+        self.sp_rho_o.setValue(p['rho_o'])
+        self.sp_d.setValue(p['d'])
+        self.sp_t.setValue(p['t'])
+        self.sp_dt.setValue(p['dt'])
+
+    def get_params(self):
+        return dict(
+            Uo=self.sp_Uo.value(),
+            Uw=self.sp_Uw.value(),
+            rho_o=self.sp_rho_o.value(),
+            rho_w=self.sp_rho_w.value(),
+            mu_o=self.sp_mu_o.value() * 1e-3,
+            mu_w=self.sp_mu_w.value() * 1e-3,
+            d_leak=self.sp_d.value(),
+            x_leak=self.sp_xleak.value(),
+            t_total=self.sp_t.value(),
+            dt_out=self.sp_dt.value(),
+        )
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Subsea Oil Spill Simulator")
+        self.setGeometry(50, 50, 1400, 800)
+        self.setStyleSheet(f"background-color:{BG_DARK}; color:{TEXT_PRIM};")
+
+        # ─ Layout ───────────────────────────────────────
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QHBoxLayout(central)
+
+        # Parameter panel
+        self.param_panel = ParamPanel()
+        layout.addWidget(self.param_panel, 0)
+
+        # Propagation canvas
+        self.canvas = PropagationCanvas()
+        layout.addWidget(self.canvas, 1)
+
+        # ─ Buttons and progress ─────────────────────────
+        control_panel = QVBoxLayout()
+        self.btn_run = primary_btn("▶ Run Simulation")
+        self.btn_run.clicked.connect(self.start_simulation)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        control_panel.addWidget(self.btn_run)
+        control_panel.addWidget(self.progress)
+        layout.addLayout(control_panel)
+
+        # Simulation variables
+        self.frames = []
+        self.current_frame = 0
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.next_frame)
+
+        # Physics engine
+        self.physics = OilSpillPhysics()
+
+    # ─ Start simulation in a separate thread ─────────
+    def start_simulation(self):
+        # Update physics from GUI inputs
+        self.physics.Uo  = self.param_panel.sp_Uo.value()
+        self.physics.Uw  = self.param_panel.sp_Uw.value()
+        self.physics.rho_o = self.param_panel.sp_rho_o.value()
+        self.physics.d_leak = self.param_panel.sp_d.value()
+        self.physics.t_total = self.param_panel.sp_t.value()
+        self.physics.dt_out = self.param_panel.sp_dt.value()
+        self.physics._build_grid()
+
+        # Disable run button
+        self.btn_run.setEnabled(False)
+        self.progress.setValue(0)
+        self.frames = []
+        self.current_frame = 0
+
+        # Start worker
+        self.worker = SimWorker(self.physics)
+        self.worker.done.connect(self.simulation_done)
+        self.worker.error.connect(self.simulation_error)
+        self.worker.start()
+
+    # ─ Called when simulation completes ─────────────
+    def simulation_done(self, frames):
+        self.frames = frames
+        self.progress.setMaximum(len(frames))
+        self.current_frame = 0
+        self.timer.start(50)  # update every 50 ms
+
+    def simulation_error(self, msg):
+        QMessageBox.critical(self, "Simulation Error", msg)
+        self.btn_run.setEnabled(True)
+
+    # ─ Animate frame by frame ───────────────────────
+    def next_frame(self):
+        if self.current_frame >= len(self.frames):
+            self.timer.stop()
+            self.btn_run.setEnabled(True)
+            return
+
+        frame = self.frames[self.current_frame]
+        self.canvas.update_frame(frame, self.physics, self.frames)
+        self.current_frame += 1
+        self.progress.setValue(self.current_frame)
+# ─────────────────────────────────────────────────────────────────────────────
+#  METRICS BAR
+# ─────────────────────────────────────────────────────────────────────────────
+class MetricsBar(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(52)
+        self.setStyleSheet(f"background:{BG_PANEL}; border-top:1px solid {BORDER};")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 4, 14, 4)
+        lay.setSpacing(30)
+
+        self.lbls = {}
+        metrics = [
+            ("t", "Time", "s"),
+            ("R", "R = Uₒ/Uᵥ", ""),
+            ("R1", "R₁ = Uₒ₁/Uᵥ₁", ""),
+            ("Uo1", "Uₒ₁ (vert.)", "m/s"),
+            ("Uw1", "Uᵥ₁ (horiz.)", "m/s"),
+            ("k_max", "k_max", "m²/s²"),
+            ("nu_t", "ν_t max", "m²/s"),
+        ]
+        for key, label, unit in metrics:
+            col = QVBoxLayout()
+            col.setSpacing(1)
+            title = QLabel(label)
+            title.setStyleSheet(f"color:{TEXT_SEC}; font-size:9px;")
+            val = QLabel("—")
+            val.setStyleSheet(f"color:{TEXT_PRIM}; font-size:13px; font-weight:bold;")
+            col.addWidget(title)
+            col.addWidget(val)
+            self.lbls[key] = val
+            lay.addLayout(col)
+            if key != "nu_t":
+                sep = QFrame()
+                sep.setFrameShape(QFrame.VLine)
+                sep.setStyleSheet(f"color:{BORDER};")
+                lay.addWidget(sep)
+
+    def update(self, frame):
+        self.lbls['t'].setText(f"{frame['t']:.1f} s")
+        self.lbls['R'].setText(f"{frame['R']:.1f}")
+        self.lbls['R1'].setText(f"{frame['R1']:.3f}")
+        self.lbls['Uo1'].setText(f"{frame['Uo1']:.3f}")
+        self.lbls['Uw1'].setText(f"{frame['Uw1']:.3f}")
+        self.lbls['k_max'].setText(f"{frame['k_max']:.3f}")
+        self.lbls['nu_t'].setText(f"{frame['nu_t_max']:.4f}")
+
+        # Colour R1
+        R = frame['R']
+        col = ACCENT_3 if R < 10 else (ACCENT_2 if R <= 150 else ACCENT_4)
+        self.lbls['R'].setStyleSheet(f"color:{col}; font-size:13px; font-weight:bold;")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TIMELINE SCRUBBER
+# ─────────────────────────────────────────────────────────────────────────────
+class TimelineBar(QWidget):
+    frame_changed = pyqtSignal(int)
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(46)
+        self.setStyleSheet(f"background:{BG_PANEL}; border-top:1px solid {BORDER};")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 4, 12, 4)
+        lay.setSpacing(10)
+
+        self.play_btn  = primary_btn("▶  Play",  ACCENT_2, "#5edc70")
+        self.play_btn.setFixedWidth(100)
+        self.play_btn.setEnabled(False)
+        lay.addWidget(self.play_btn)
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setMinimum(0)
+        self.slider.setValue(0)
+        self.slider.setEnabled(False)
+        self.slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{
+                background:{BG_CARD}; height:6px; border-radius:3px;
+                border:1px solid {BORDER};
+            }}
+            QSlider::handle:horizontal {{
+                background:{ACCENT_1}; width:14px; height:14px;
+                margin:-4px 0; border-radius:7px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background:{ACCENT_1}; border-radius:3px;
+            }}
+        """)
+        self.slider.valueChanged.connect(self.frame_changed)
+        lay.addWidget(self.slider, 1)
+
+        self.t_lbl = styled_label("0.0 / 0.0 s", TEXT_SEC, 10)
+        self.t_lbl.setFixedWidth(90)
+        lay.addWidget(self.t_lbl)
+
+        self.speed_cb = QComboBox()
+        for spd in ["0.5×", "1×", "2×", "4×"]:
+            self.speed_cb.addItem(spd)
+        self.speed_cb.setCurrentIndex(1)
+        self.speed_cb.setStyleSheet(f"""
+            QComboBox {{
+                background:{BG_HOVER}; color:{TEXT_PRIM}; border:1px solid {BORDER};
+                border-radius:4px; padding:2px 6px; font-size:10px;
+            }}
+            QComboBox::drop-down {{ border:none; }}
+            QComboBox QAbstractItemView {{
+                background:{BG_CARD}; color:{TEXT_PRIM};
+                selection-background-color:{ACCENT_1}; selection-color:{BG_DARK};
+            }}
+        """)
+        lay.addWidget(self.speed_cb)
+
+    def configure(self, n_frames, t_total):
+        self.slider.setMaximum(n_frames - 1)
+        self.slider.setValue(0)
+        self.slider.setEnabled(True)
+        self.play_btn.setEnabled(True)
+        self._t_total = t_total
+        self._update_label(0)
+
+    def set_frame(self, idx):
+        self.slider.setValue(idx)
+
+    def _update_label(self, idx):
+        t = idx * (self._t_total / max(self.slider.maximum(), 1))
+        self.t_lbl.setText(f"t = {t:.1f} s")
+
+    def get_speed(self):
+        speeds = [0.5, 1.0, 2.0, 4.0]
+        return speeds[self.speed_cb.currentIndex()]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN WINDOW
+# ─────────────────────────────────────────────────────────────────────────────
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(
+            "SUBSEA OIL SPILL PROPAGATION SIMULATOR  ·  Ji et al. 2020")
+        self.setMinimumSize(1440, 860)
+        self.resize(1540, 920)
+
+        self.physics  = OilSpillPhysics()
+        self.frames   = []
+        self._cur_idx = 0
+        self._playing = False
+        self._timer   = QTimer()
+        self._timer.timeout.connect(self._advance_frame)
+
+        self._build_ui()
+        self._apply_palette()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+    def _build_ui(self):
+        root = QWidget()
+        self.setCentralWidget(root)
+        root_lay = QVBoxLayout(root)
+        root_lay.setContentsMargins(0, 0, 0, 0)
+        root_lay.setSpacing(0)
+
+        # Header bar
+        root_lay.addWidget(self._make_header())
+
+        # Main content
+        content = QWidget()
+        content.setStyleSheet(f"background:{BG_DARK};")
+        content_lay = QHBoxLayout(content)
+        content_lay.setContentsMargins(0, 0, 0, 0)
+        content_lay.setSpacing(0)
+
+        # Left panel
+        left = QWidget()
+        left.setFixedWidth(290)
+        left.setStyleSheet(f"background:{BG_PANEL}; border-right:1px solid {BORDER};")
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(10, 10, 10, 10)
+        left_lay.setSpacing(8)
+
+        # Scroll area for params
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea{border:none; background:transparent;}"
+                             f"QScrollBar:vertical{{background:{BG_PANEL};"
+                             f"width:6px; border:none;}}"
+                             f"QScrollBar::handle:vertical{{background:{BORDER};"
+                             f"border-radius:3px;}}")
+        self.params = ParamPanel()
+        scroll.setWidget(self.params)
+        left_lay.addWidget(scroll, 1)
+
+        # Run / Default / Exit buttons
+        self.btn_run = primary_btn("▶  RUN SIMULATION", ACCENT_1)
+        self.btn_run.clicked.connect(self._run)
+        left_lay.addWidget(self.btn_run)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)  # indeterminate
+        self.progress.setVisible(False)
+        self.progress.setFixedHeight(6)
+        self.progress.setStyleSheet(f"""
+            QProgressBar {{ background:{BG_CARD}; border:none; border-radius:3px; }}
+            QProgressBar::chunk {{ background:{ACCENT_1}; border-radius:3px; }}
+        """)
+        left_lay.addWidget(self.progress)
+
+        btn_row2 = QHBoxLayout()
+        btn_default = secondary_btn("↺  Defaults")
+        btn_default.clicked.connect(self.params.load_defaults)
+        btn_exit    = secondary_btn("✕  Exit")
+        btn_exit.clicked.connect(self.close)
+        btn_row2.addWidget(btn_default)
+        btn_row2.addWidget(btn_exit)
+        left_lay.addLayout(btn_row2)
+
+        content_lay.addWidget(left)
+
+        # Right: canvas
+        right = QWidget()
+        right.setStyleSheet(f"background:{BG_DARK};")
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(6, 6, 6, 0)
+        right_lay.setSpacing(0)
+
+        self.canvas = PropagationCanvas()
+        right_lay.addWidget(self.canvas, 1)
+
+        content_lay.addWidget(right, 1)
+        root_lay.addWidget(content, 1)
+
+        # Timeline
+        self.timeline = TimelineBar()
+        self.timeline.play_btn.clicked.connect(self._toggle_play)
+        self.timeline.slider.valueChanged.connect(self._on_slider)
+        self.timeline.speed_cb.currentIndexChanged.connect(self._update_speed)
+        root_lay.addWidget(self.timeline)
+
+        # Metrics bar
+        self.metrics = MetricsBar()
+        root_lay.addWidget(self.metrics)
+
+        # Status bar
+        sb = QStatusBar()
+        sb.setStyleSheet(f"background:{BG_PANEL}; color:{TEXT_SEC}; font-size:10px;"
+                         f"border-top:1px solid {BORDER};")
+        self.setStatusBar(sb)
+        sb.showMessage(
+            "Set parameters → Run Simulation → Press ▶ Play to animate propagation")
+
+    def _make_header(self):
+        hdr = QWidget()
+        hdr.setFixedHeight(50)
+        hdr.setStyleSheet(
+            f"background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            f"stop:0 #0d2137, stop:0.5 #0a1628, stop:1 #0d1117);"
+            f"border-bottom:1px solid {BORDER};"
+        )
+        lay = QHBoxLayout(hdr)
+        lay.setContentsMargins(16, 0, 16, 0)
+
+        title = QLabel("🛢  SUBSEA OIL SPILL PROPAGATION SIMULATOR")
+        title.setStyleSheet(
+            f"color:{ACCENT_1}; font-size:15px; font-weight:bold;"
+            f"letter-spacing:1px;")
+        lay.addWidget(title)
+        lay.addStretch()
+
+        sub = QLabel("VOF · Realizable k-ε · Ji et al. (2020) · Sci. Rep. 10:9226")
+        sub.setStyleSheet(f"color:{TEXT_SEC}; font-size:10px;")
+        lay.addWidget(sub)
+        return hdr
+
+    def _apply_palette(self):
+        pal = QPalette()
+        pal.setColor(QPalette.Window,      QColor(BG_DARK))
+        pal.setColor(QPalette.WindowText,  QColor(TEXT_PRIM))
+        pal.setColor(QPalette.Base,        QColor(BG_CARD))
+        pal.setColor(QPalette.Text,        QColor(TEXT_PRIM))
+        pal.setColor(QPalette.Button,      QColor(BG_PANEL))
+        pal.setColor(QPalette.ButtonText,  QColor(TEXT_PRIM))
+        self.setPalette(pal)
+
+    # ── Simulation control ────────────────────────────────────────────────────
+    def _run(self):
+        p = self.params.get_params()
+        # Apply to physics
+        ph = self.physics
+        ph.Uo    = p['Uo']
+        ph.Uw    = p['Uw']
+        ph.rho_o = p['rho_o']
+        ph.rho_w = p['rho_w']
+        ph.mu_o  = p['mu_o']
+        ph.mu_w  = p['mu_w']
+        ph.d_leak  = p['d_leak']
+        ph.x_leak  = p['x_leak']
+        ph.t_total = p['t_total']
+        ph.dt_out  = p['dt_out']
+
+        self.btn_run.setEnabled(False)
+        self.btn_run.setText("⏳  Computing…")
+        self.progress.setVisible(True)
+        self.statusBar().showMessage("Running simulation…")
+
+        self._worker = SimWorker(self.physics)
+        self._worker.done.connect(self._on_sim_done)
+        self._worker.error.connect(self._on_sim_error)
+        self._worker.start()
+
+    def _on_sim_done(self, frames):
+        self.frames = frames
+        self._cur_idx = 0
+        self.progress.setVisible(False)
+        self.btn_run.setEnabled(True)
+        self.btn_run.setText("▶  RUN SIMULATION")
+
+        n = len(frames)
+        self.timeline.configure(n, self.physics.t_total)
+        self._render_frame(0)
+        self.statusBar().showMessage(
+            f"Done — {n} frames · Δt = {self.physics.dt_out:.1f} s  "
+            f"·  Press ▶ Play to animate  ·  Or drag the timeline slider")
+
+    def _on_sim_error(self, msg):
+        self.progress.setVisible(False)
+        self.btn_run.setEnabled(True)
+        self.btn_run.setText("▶  RUN SIMULATION")
+        QMessageBox.critical(self, "Simulation Error", msg)
+
+    # ── Playback ──────────────────────────────────────────────────────────────
+    def _toggle_play(self):
+        if not self.frames:
+            return
+        self._playing = not self._playing
+        if self._playing:
+            self.timeline.play_btn.setText("⏸  Pause")
+            self.timeline.play_btn.setStyleSheet(
+                self.timeline.play_btn.styleSheet().replace(ACCENT_2, ACCENT_3))
+            self._update_speed()
+            self._timer.start()
+        else:
+            self._playing = False
+            self.timeline.play_btn.setText("▶  Play")
+            self._timer.stop()
+
+    def _update_speed(self):
+        base_ms = 150  # base interval
+        spd = self.timeline.get_speed()
+        self._timer.setInterval(int(base_ms / spd))
+
+    def _advance_frame(self):
+        if not self.frames:
+            return
+        nxt = self._cur_idx + 1
+        if nxt >= len(self.frames):
+            nxt = 0  # loop
+        self.timeline.set_frame(nxt)   # triggers _on_slider → _render_frame
+
+    def _on_slider(self, idx):
+        self._cur_idx = idx
+        t = idx * self.physics.dt_out
+        self.timeline.t_lbl.setText(f"t = {t:.1f} s")
+        if self.frames:
+            self._render_frame(idx)
+
+    def _render_frame(self, idx):
+        if not self.frames or idx >= len(self.frames):
+            return
+        frame = self.frames[idx]
+        self.canvas.update_frame(frame, self.physics, self.frames)
+        self.metrics.update(frame)
+
+    def closeEvent(self, event):
+        self._timer.stop()
+        plt.close('all')
+        event.accept()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    # Dark fusion palette at app level
+    dark = QPalette()
+    dark.setColor(QPalette.Window,          QColor(BG_DARK))
+    dark.setColor(QPalette.WindowText,      QColor(TEXT_PRIM))
+    dark.setColor(QPalette.Base,            QColor(BG_CARD))
+    dark.setColor(QPalette.AlternateBase,   QColor(BG_PANEL))
+    dark.setColor(QPalette.ToolTipBase,     QColor(TEXT_PRIM))
+    dark.setColor(QPalette.ToolTipText,     QColor(TEXT_PRIM))
+    dark.setColor(QPalette.Text,            QColor(TEXT_PRIM))
+    dark.setColor(QPalette.Button,          QColor(BG_PANEL))
+    dark.setColor(QPalette.ButtonText,      QColor(TEXT_PRIM))
+    dark.setColor(QPalette.BrightText,      QColor("#ff6b6b"))
+    dark.setColor(QPalette.Highlight,       QColor(ACCENT_1))
+    dark.setColor(QPalette.HighlightedText, QColor(BG_DARK))
+    app.setPalette(dark)
+
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main() 
+    
+    
